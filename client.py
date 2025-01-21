@@ -80,22 +80,6 @@ def send_request(sock, json_args, media_type, payload):
     sock.sendall(header + body)
 
 
-'''
-def receive_response(sock):
-
-    #ヘッダーの受信
-    header = recv_all(sock, HEADER_SIZE)
-    json_size = int.from_bytes(header[:2], 'big')
-    media_type_size = header[2]
-    payload_size = int.from_bytes(header[3:8], 'big')
-
-    #ボディの受信
-    json_data = recv_all(sock, json_size).decode('utf-8') if json_size > 0 else ''
-    media_type = recv_all(sock, media_type_size).decode('utf-8') if media_type_size > 0 else ''
-    payload = recv_all(sock, payload_size) if payload_size > 0 else b''
-
-    return json_data, media_type, payload
-    '''
 
 def receive_response(sock):
     """
@@ -109,7 +93,6 @@ def receive_response(sock):
         # 行をバイナリで読み込む (末尾に b'\n' が入る)
         line = f.readline()
         if not line:
-            # サーバーが切断した場合
             raise EOFError("サーバーがレスポンスを切断しました。")
 
         # 行が PROGRESS: で始まる場合は進行状況を表示
@@ -151,8 +134,6 @@ def receive_response(sock):
             return json_data, media_type, payload
 
         else:
-            # もし想定外の行が来たらどうするか？
-            # ここではとりあえず無視する
             pass
 
 
