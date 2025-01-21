@@ -4,22 +4,20 @@ import ffmpeg
 import time
 import json
 import logging
-import uuid  #出力ファイルにユニバーサリー一意の識別子を割り振る
+import uuid  # 出力ファイルにユニバーサリー一意の識別子を割り振る
 import threading
 from threading import Lock
 
-#ログ設定
+# ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 SERVER_ADDRESS = '0.0.0.0'
-SERVER_PORT = 12345
+SERVER_PORT = 12348
 STREAM_RATE = 1400
-HEADER_SIZE = 8 #64ビット
+HEADER_SIZE = 8  # 64ビット
 MAX_JSON_SIZE = 216
 MAX_MEDIA_TYPE_SIZE = 4
-MAX_PAYLOAD_SIZE = (1 << 40) #1TB
-
-RESPONSE_SIZE = 16
+MAX_PAYLOAD_SIZE = (1 << 40)  # 1TB
 
 UPLOAD_DIR = 'uploads'
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -28,7 +26,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 active_ips = {}
 active_ips_lock = Lock()
 
-#ジョブステータスの管理
+# ジョブステータスの管理
 jobs_status = {}
 jobs_lock = Lock()
 #------------------------------------------------------
@@ -41,64 +39,78 @@ jobs_lock = Lock()
 5.GIF,WEBMフォーマットに変換
 '''
 #--------------------------------------------------------
+
 def recv_all(connection, length):
     """指定されたバイト数を確実に受信する関数"""
     data = b''
     while len(data) < length:
         more = connection.recv(length - len(data))
         if not more:
-            raise EOFError("Expected {length} bytes but received {len(data)} bytes before the connection closed.")
+            raise EOFError(f"Expected {length} bytes but received {len(data)} bytes before the connection closed.")
         data += more
     return data
 
-
-def send_response(connection, status, message, media_type, payload):
-    """
-    最終レスポンスを送信
-    """
+def send_progress(connection):
+    """定期的に進捗メッセージを送信"""
     try:
-        # JSON レスポンス作成
-        response_json = json.dumps({"status": status, "message": message}).encode("utf-8")
+        while True:
+            time.sleep(10)  # 10秒に1回メッセージを送信
+            progress_response = {
+                'status': 'in_progress',
+                'message': '進行中です'
+            }
+            response_json = json.dumps(progress_response).encode('utf-8')
+            connection.sendall(response_json + b'\n')  # 改行区切りで送信
+            logging.info(f"送信した進捗データ: {progress_response}")
+    except Exception as e:
+        logging.error(f"進捗状況の送信中にエラーが発生しました: {e}")
+
+
+def send_response(connection, status, message='', media_type='', payload=b''):
+    """
+    レスポンスを送信する関数
+    - status: 'success' または 'error'
+    - message: ステータスの詳細
+    - media_type: レスポンスのメディアタイプ
+    - payload: バイナリデータ
+    """
+    response = {
+        'status': status,
+        'message': message,
+    }
+    response_json = json.dumps(response).encode('utf-8')
+    json_size = len(response_json)
+    if json_size > MAX_JSON_SIZE:
+        response_json = json.dumps({'status': 'error', 'message': 'Response JSON too large.'}).encode('utf-8')
         json_size = len(response_json)
-        media_type_encoded = media_type.encode("utf-8")
+    media_type_encoded = media_type.encode('utf-8')
+    media_type_size = len(media_type_encoded)
+    if media_type_size > MAX_MEDIA_TYPE_SIZE:
+        media_type_encoded = media_type_encoded[:MAX_MEDIA_TYPE_SIZE]
         media_type_size = len(media_type_encoded)
+
+    payload_size = len(payload)
+    if payload_size > MAX_PAYLOAD_SIZE:
+        payload = payload[:MAX_PAYLOAD_SIZE]
         payload_size = len(payload)
 
-        # サイズの検証
-        if json_size > MAX_JSON_SIZE or media_type_size > MAX_MEDIA_TYPE_SIZE or payload_size > MAX_PAYLOAD_SIZE:
-            raise ValueError("レスポンスのサイズが制限を超えています。")
+    # ヘッダーの作成
+    header = json_size.to_bytes(2, 'big') + bytes([media_type_size]) + payload_size.to_bytes(5, 'big')
+    header += b'\0' * (HEADER_SIZE - 8)  # 余りのバイトをパディング
+    # ボディの作成
+    body = response_json + media_type_encoded + payload
 
-        # ヘッダー作成
-        header = (
-            json_size.to_bytes(2, "big")
-            + bytes([media_type_size])
-            + payload_size.to_bytes(5, "big")
-        )
-
-        # ヘッダー + ボディ送信
-        connection.sendall(b"FINAL:\n")
-        connection.sendall(header)
-        connection.sendall(response_json + media_type_encoded + payload)
-        logging.info(f"最終レスポンスを送信しました: status={status}, payload_size={payload_size}")
-    except Exception as e:
-        logging.error(f"最終レスポンス送信エラー: {e}")
-
-
-def send_progress(connection, stop_event):
-    """
-    定期的に進行中メッセージを送信 (改行付きで行として送る)
-    """
     try:
-        while not stop_event.is_set():
-            time.sleep(10)  # 10秒ごとに進行中メッセージを送信
-            progress_message = "PROGRESS: 作業中です...\n"
-            connection.sendall(progress_message.encode('utf-8'))
+        # デバッグ用ログ
+        logging.debug(f"送信するレスポンス: json_size={json_size}, media_type_size={media_type_size}, payload_size={payload_size}")
+        logging.debug(f"レスポンスヘッダー: {header}")
+        logging.debug(f"レスポンスボディの一部: {response_json[:100]}")  # JSON部分の先頭100バイト
+        # 送信
+        connection.sendall(header + body)
+    except BrokenPipeError:
+        logging.error("クライアント接続が閉じられたため、レスポンスを送信できませんでした。")
     except Exception as e:
-        logging.error(f"進行中メッセージ送信中にエラーが発生しました: {e}")
-
-
-
-
+        logging.error(f"レスポンス送信中にエラーが発生しました: {e}")
 
 def handle_client(connection, client_address):
     ip = client_address[0]
@@ -112,9 +124,6 @@ def handle_client(connection, client_address):
         else:
             active_ips[ip] = active_ips.get(ip, 0) + 1
 
-
-    stop_event = threading.Event()
-    progress_thread = threading.Thread(target=send_progress, args=(connection, stop_event))
     try:
         # ヘッダーの受信
         header = recv_all(connection, HEADER_SIZE)
@@ -128,18 +137,25 @@ def handle_client(connection, client_address):
         payload = recv_all(connection, payload_size)
 
         logging.info(f"リクエスト受信: operation={json.loads(json_data).get('operation')}, media_type={media_type}, payload_size={payload_size} bytes")
+
+        # ジョブIDを生成
+        job_id = str(uuid.uuid4())
+        with jobs_lock:
+            jobs_status[job_id] = {'progress': 0, 'status': 'in_progress'}
+
+        # 進捗送信スレッドの開始
+        progress_thread = threading.Thread(target=send_progress, args=(connection, ))
         progress_thread.start()
 
-        # 動画処理の実行
-        result = process_request(json_data, media_type, payload)
-
-        # 処理完了時に進捗スレッドを停止
-        stop_event.set()
-        progress_thread.join()
+        # 動画処理の実行（ジョブIDを渡す）
+        result = process_request(json_data, media_type, payload, job_id)
 
         # 成功レスポンスの送信
         send_response(connection, result['status'], result['message'], result['media_type'], result['payload'])
         logging.info(f"処理完了: {result['media_type']}, payload_size={len(result['payload'])} bytes")
+
+        # 進捗スレッドの終了を待機
+        progress_thread.join()
 
     except Exception as e:
         logging.error(f"エラー発生: {e}")
@@ -153,17 +169,17 @@ def handle_client(connection, client_address):
                 del active_ips[ip]
         logging.info(f"クライアント {client_address} との接続を閉じました。")
 
-
-def process_request(json_args, media_type, payload):
-    #一時ファイルの作成
+def process_request(json_args, media_type, payload, job_id):
+    # 一時ファイルの作成
     input_filename = f"input_{uuid.uuid4()}.{media_type}"
     input_path = os.path.join(UPLOAD_DIR, input_filename)
     with open(input_path, 'wb') as f:
         f.write(payload)
 
-    #処理結果のファイルパス
+    # 処理結果のファイルパス
     output_filename = f"output_{uuid.uuid4()}.mp4"  # 出力形式は要件に応じて変更
     output_path = os.path.join(UPLOAD_DIR, output_filename)
+
     try:
         '''動画処理の実装'''
         args = json.loads(json_args)
@@ -173,7 +189,7 @@ def process_request(json_args, media_type, payload):
                 ffmpeg
                 .input(input_path)
                 .output(output_path, video_bitrate='500k')
-                .run(overwrite_output = True)
+                .run(overwrite_output=True)
             )
         elif operation == 'change_resolution':
             width = args.get('width')
@@ -185,19 +201,19 @@ def process_request(json_args, media_type, payload):
                 .input(input_path)
                 .filter('scale', width, height)
                 .output(output_path)
-                .run(overwrite_output = True)
+                .run(overwrite_output=True)
             )
         elif operation == 'change_aspect_ratio':
             aspect_ratio = args.get('aspect_ratio')
             if not aspect_ratio:
-                return ValueError('Aspect ratio must be specified.')
+                raise ValueError('Aspect ratio must be specified.')
             (
                 ffmpeg
                 .input(input_path)
                 .filter('setsar', '1')
-                .filter('setdar', aspect_ratio) #set dislay aspect ratio
+                .filter('setdar', aspect_ratio)  # set display aspect ratio
                 .output(output_path)
-                .run(overwrite_output = True)
+                .run(overwrite_output=True)
             )
         elif operation == 'extract_audio':
             output_filename = f"audio_{uuid.uuid4()}.mp3"
@@ -206,7 +222,7 @@ def process_request(json_args, media_type, payload):
                 ffmpeg
                 .input(input_path)
                 .output(output_path, format='mp3', acodec='libmp3lame', ab='192k')
-                .run(overwrite_output = True)
+                .run(overwrite_output=True)
             )
         elif operation == 'create_gif':
             start_time = args.get('start_time')
@@ -237,40 +253,63 @@ def process_request(json_args, media_type, payload):
         else:
             raise ValueError('Unsupported operation.')
 
+        # 処理中に進捗を更新
+        for progress in range(10, 101, 10):  # 10%刻みで進捗更新
+            time.sleep(6)  # 処理の進行を模擬
+            with jobs_lock:
+                if job_id not in jobs_status:
+                    logging.error(f"ジョブ {job_id} が jobs_status に存在しません。進捗更新をスキップします。")
+                    break
+                jobs_status[job_id]['progress'] = progress
+            logging.info(f"ジョブ {job_id}: 進捗 {progress}% を更新しました")
 
+        logging.info(f"ジョブ {job_id} の処理を完了しました: {args}")
 
-        #出力を読み込んで返す
+        # 出力ファイルを読み込んで返す
         with open(output_path, 'rb') as f:
             output_payload = f.read()
 
-
+        # 入力ファイルの削除
         os.remove(input_path)
-        return {'status': 'success', 'message': 'Processing completed.', 'media_type': os.path.splitext(output_filename)[1][1:], 'payload': output_payload}
+        # 出力ファイルの削除（必要に応じて）
+        os.remove(output_path)
+
+        return {
+            'status': 'success',
+            'message': 'Processing completed.',
+            'media_type': os.path.splitext(output_filename)[1][1:],
+            'payload': output_payload,
+            'job_id': job_id
+        }
+
     except Exception as e:
         os.remove(input_path)
+        logging.error(f"ジョブ {job_id} の処理中にエラーが発生しました: {e}")
+        # ジョブステータスを更新
+        with jobs_lock:
+            jobs_status[job_id]['status'] = 'error'
+            jobs_status[job_id]['message'] = str(e)
         raise e
-
 
 def start_server():
     """サーバーを起動する関数"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((SERVER_ADDRESS,SERVER_PORT))
+        sock.bind((SERVER_ADDRESS, SERVER_PORT))
         sock.listen(5)
         logging.info(f"サーバーが {SERVER_ADDRESS}:{SERVER_PORT} で待機中です。")
 
-        #クライアントの接続待ち状態
+        # クライアントの接続待ち状態
         while True:
             try:
                 connection, client_address = sock.accept()
-                client_thread = threading.Thread(target = handle_client, args=(connection, client_address))
-                client_thread.daemon = True # メインプログラムの終了時にスレッドも終了
+                client_thread = threading.Thread(target=handle_client, args=(connection, client_address))
+                client_thread.daemon = True  # メインプログラムの終了時にスレッドも終了
                 client_thread.start()
             except KeyboardInterrupt:
                 logging.info("サーバーを停止します")
                 break
             except Exception as e:
                 logging.error(f"接続待機中にエラーが発生しました: {e}")
-
 
 if __name__ == "__main__":
     start_server()

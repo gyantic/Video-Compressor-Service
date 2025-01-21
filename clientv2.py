@@ -5,15 +5,15 @@ import argparse
 import json
 import time
 from tqdm import tqdm
-
+from threading import Thread
 
 DEFAULT_SERVER_ADDRESS = '127.0.0.1'  # デフォルトのサーバーIPアドレス
-DEFAULT_SERVER_PORT = 12345            # デフォルトのサーバーポート
-STREAM_RATE = 1400             # 送信するチャンクサイズ
-HEADER_SIZE = 8               # ヘッダーのサイズ：8バイト(JSON:2,mediatype:1,payload:5バイト)
+DEFAULT_SERVER_PORT = 12348            # デフォルトのサーバーポート
+STREAM_RATE = 1400                      # 送信するチャンクサイズ
+HEADER_SIZE = 8                        # ヘッダーのサイズ：8バイト(JSON:2, mediatype:1, payload:5バイト)
 MAX_JSON_SIZE = 216
 MAX_MEDIA_TYPE_SIZE = 4
-MAX_PAYLOAD_SIZE = (1<<40) #1TB
+MAX_PAYLOAD_SIZE = (1<<40)            #1TB
 
 '''
 クライアントの機能：
@@ -21,7 +21,6 @@ MAX_PAYLOAD_SIZE = (1<<40) #1TB
 処理リクエストをJSON形式でサーバーに送信。
 サーバーからのレスポンスを受信し、処理結果のファイルをダウンロード。
 '''
-
 
 def is_mp4(filepath):
     try:
@@ -42,12 +41,12 @@ def recv_all(sock, length):
         data += more
     return data
 
-def send_request(sock, json_args, media_type, payload):
+def send_request(sock, json_args, media_type, payload_size):
     """
     リクエストを送信する関数
     - json_args: JSON形式の引数
     - media_type: メディアタイプ（例: 'mp4'）
-    - payload: バイナリデータ
+    - payload_size: バイナリデータのサイズ（バイト単位）
     MMPプロトコルに従う
     """
     json_bytes = json.dumps(json_args).encode('utf-8')
@@ -59,12 +58,12 @@ def send_request(sock, json_args, media_type, payload):
     media_type_size = len(media_type_bytes)
     if media_type_size > MAX_MEDIA_TYPE_SIZE:
         raise ValueError('Media type size exceeds maximum allowed.')
-    payload_size = len(payload)
+
     if payload_size > MAX_PAYLOAD_SIZE:
         raise ValueError('Payload size exceeds maximum allowed.')
 
     # ヘッダーの作成
-    header = json_size.to_bytes(2, 'big') + bytes ([media_type_size]) + payload_size.to_bytes(5, 'big')
+    header = json_size.to_bytes(2, 'big') + bytes([media_type_size]) + payload_size.to_bytes(5, 'big')
     header += b'\0' * (HEADER_SIZE - 8)  # 余りのバイトをパディング
 
     # ボディの作成
@@ -73,90 +72,54 @@ def send_request(sock, json_args, media_type, payload):
     ボディの内容
     jsonデータ: リクエストの引数をJSON形式でエンコード
     media_type: ファイルの拡張子をUTF-8でエンコード
-    ペイロード: ファイルのバイナリデータ
+    ペイロード: バイナリデータのサイズをヘッダーに含めるのみ
     '''
 
     # ヘッダーとボディの送信
     sock.sendall(header + body)
 
+def receive_progress(sock):
+    """サーバーからの進捗メッセージを受信して表示"""
+    try:
+        while True:
+            data = sock.recv(1024)  # 受信
+            if not data:
+                print("サーバーが接続を閉じました")
+                break
 
-'''
+            # デコードしてメッセージを表示
+            try:
+                response = json.loads(data.decode('utf-8'))
+                if response.get('status') == 'in_progress':
+                    print(response['message'])  # 進行中ですを表示
+                elif response.get('status') == 'success':
+                    print(f"処理が完了しました: {response['message']}")
+                    break
+            except json.JSONDecodeError:
+                print(f"JSON解析エラー: {data}")
+    except Exception as e:
+        print(f"進捗受信中にエラーが発生しました: {e}")
+
 def receive_response(sock):
-
-    #ヘッダーの受信
+    '''
+    レスポンスを受信する関数
+    ヘッダを解析してJSONデータ、メディアタイプ、ペイロードの受信
+    - sock: ソケットオブジェクト
+    '''
+    # ヘッダーの受信
     header = recv_all(sock, HEADER_SIZE)
     json_size = int.from_bytes(header[:2], 'big')
     media_type_size = header[2]
     payload_size = int.from_bytes(header[3:8], 'big')
 
-    #ボディの受信
+    # ボディの受信
     json_data = recv_all(sock, json_size).decode('utf-8') if json_size > 0 else ''
     media_type = recv_all(sock, media_type_size).decode('utf-8') if media_type_size > 0 else ''
     payload = recv_all(sock, payload_size) if payload_size > 0 else b''
 
     return json_data, media_type, payload
-    '''
 
-def receive_response(sock):
-    """
-    サーバーからのレスポンスを受信し、PROGRESS行を表示し、
-    FINAL行があればヘッダーとペイロードを受け取り、(json_data, media_type, payload) を返す
-    """
-    # まずは行単位で読み取るためのファイルオブジェクトを作る
-    f = sock.makefile('rb')
-
-    while True:
-        # 行をバイナリで読み込む (末尾に b'\n' が入る)
-        line = f.readline()
-        if not line:
-            # サーバーが切断した場合
-            raise EOFError("サーバーがレスポンスを切断しました。")
-
-        # 行が PROGRESS: で始まる場合は進行状況を表示
-        if line.startswith(b"PROGRESS:"):
-            progress_message = line[len(b"PROGRESS:"):].strip().decode("utf-8", errors="replace")
-            print(f"進行中メッセージ: {progress_message}")
-
-        # 行が FINAL: で始まる場合は最終レスポンスを処理する
-        elif line.startswith(b"FINAL:"):
-            print("最終レスポンスを解析中...")
-
-            # ここからは「MMPプロトコルのヘッダー8バイト＋本文」を生バイナリで読む
-            header = f.read(HEADER_SIZE)
-            if len(header) < HEADER_SIZE:
-                raise EOFError("ヘッダーの読み込みに失敗しました。")
-
-            json_size = int.from_bytes(header[:2], "big")
-            media_type_size = header[2]
-            payload_size = int.from_bytes(header[3:8], "big")
-
-            # JSONの読み取り
-            json_data_bytes = f.read(json_size)
-            if len(json_data_bytes) < json_size:
-                raise EOFError("JSONデータの読み込みに失敗しました。")
-            json_data = json_data_bytes.decode("utf-8", errors="replace")
-
-            # media_type の読み取り
-            media_type_bytes = f.read(media_type_size)
-            if len(media_type_bytes) < media_type_size:
-                raise EOFError("media_typeの読み込みに失敗しました。")
-            media_type = media_type_bytes.decode("utf-8", errors="replace")
-
-            # ペイロード（バイナリ）の読み取り
-            payload = f.read(payload_size)
-            if len(payload) < payload_size:
-                raise EOFError("payloadの読み込みに失敗しました。")
-
-            # (json_data, media_type, payload) を返して終了
-            return json_data, media_type, payload
-
-        else:
-            # もし想定外の行が来たらどうするか？
-            # ここではとりあえず無視する
-            pass
-
-
-def upload_file(server_address, server_port, filepath, operation, args, status_interval = 60):
+def upload_file(server_address, server_port, filepath, operation, args, status_interval=60):
     if not os.path.isfile(filepath):
         print(f"Error: ファイル{filepath}が見つかりません")
         sys.exit(1)
@@ -174,7 +137,7 @@ def upload_file(server_address, server_port, filepath, operation, args, status_i
         print("Error: File must be below 4GB.")
         sys.exit(1)
 
-    #リクエストJSONの作成
+    # リクエストJSONの作成
     json_args = {
         'operation': operation,
         **args
@@ -183,7 +146,7 @@ def upload_file(server_address, server_port, filepath, operation, args, status_i
     # 拡張子からメディアタイプの取得
     media_type = os.path.splitext(filepath)[1][1:].lower()
 
-    #ファイルの読み込み
+    # ファイルの読み込み
     with open(filepath, 'rb') as f:
         payload = f.read()
 
@@ -192,9 +155,13 @@ def upload_file(server_address, server_port, filepath, operation, args, status_i
             sock.connect((server_address, server_port))
             print(f"サーバーに接続しました {server_address}:{server_port}")
 
-            #リクエストを送信
-            send_request(sock, json_args, media_type, payload)
+            # リクエストを送信
+            send_request(sock, json_args, media_type, payload_size=filesize)
             print(f"送信予定のファイルサイズ: {filesize}バイト")
+
+            # 進捗受信スレッドの開始
+            progress_thread = Thread(target=receive_progress, args=(sock,))
+            progress_thread.start()
 
             # ファイルデータの送信（進捗表示付き）
             print("ファイルを送信中...")
@@ -210,18 +177,26 @@ def upload_file(server_address, server_port, filepath, operation, args, status_i
                         pbar.update(len(data))
             print("ファイルの送信に成功しました")
 
+            # 進捗スレッドの終了を待機
+            progress_thread.join()
+
             # レスポンスを受信
             print("サーバーからのレスポンスを受信中...")
             json_response, response_media_type, response_payload = receive_response(sock)
-            response = json.loads(json_response) if json_response else {}
-            if response.get('status') == 'success':
-                output_filename = f"processed_{os.path.basename(filepath)}"
-                with open(output_filename, 'wb') as out_f:
-                    out_f.write(response_payload)
-                print(f"処理完了。ダウンロードされたファイル: {output_filename}")
-            else:
-                error_message = response.get('message', 'Unknown error.')
-                print(f"サーバーからのエラー: {error_message}")
+
+            try:
+                response = json.loads(json_response) if json_response else {}
+                if response.get('status') == 'success':
+                    output_filename = f"processed_{os.path.basename(filepath)}.{response.get('media_type', 'dat')}"
+                    with open(output_filename, 'wb') as out_f:
+                        out_f.write(response_payload)
+                    print(f"処理完了。ダウンロードされたファイル: {output_filename}")
+                else:
+                    error_message = response.get('message', 'Unknown error.')
+                    print(f"サーバーからのエラー: {error_message}")
+            except json.JSONDecodeError as e:
+                print(f"レスポンス解析中にエラーが発生しました: {e}")
+                print(f"受信したレスポンス: {json_response}")
 
     except socket.error as e:
         print(f"socket error: {e}")
@@ -231,12 +206,11 @@ def upload_file(server_address, server_port, filepath, operation, args, status_i
     finally:
         print("ソケットを閉じました")
 
-
 def main():
     parser = argparse.ArgumentParser(description='Upload an MP4 file to the server.')
     parser.add_argument('filepath', help='Path to the MP4 file to upload')
     parser.add_argument('--server', default=DEFAULT_SERVER_ADDRESS, help='Server IP address (default: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=DEFAULT_SERVER_PORT, help='Server port number (default: 12345)')
+    parser.add_argument('--port', type=int, default=DEFAULT_SERVER_PORT, help=f'Server port number (default: {DEFAULT_SERVER_PORT})')
     parser.add_argument('--operation', required=True, choices=[
         'compress',
         'change_resolution',
@@ -279,7 +253,6 @@ def main():
         operation=args.operation,
         args=operation_args
     )
-
 
 if __name__ == "__main__":
     main()
